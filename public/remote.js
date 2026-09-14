@@ -26,23 +26,65 @@ async function refresh() {
 }
 
 async function openBrowser(url) {
-  const current = await api('/api/session', { method: 'POST', body: JSON.stringify({ url }) });
-  sessionId = current.id;
-  empty.hidden = true;
-  screen.hidden = false;
-  canvas.width = current.width;
-  canvas.height = current.height;
-  stream = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream/${sessionId}`);
-  stream.addEventListener('message', async (event) => {
-    const message = JSON.parse(event.data);
-    if (message.type !== 'frame') return;
-    const image = new Image();
-    image.onload = () => context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    image.src = `data:image/jpeg;base64,${message.data}`;
-  });
-  await refresh();
-  clearInterval(refreshTimer);
-  refreshTimer = setInterval(refresh, 1400);
+  state.textContent = 'Loading…';
+
+  try {
+    const current = await api('/api/session', {
+      method: 'POST',
+      body: JSON.stringify({ url })
+    });
+
+    sessionId = current.id;
+    empty.hidden = true;
+    screen.hidden = false;
+
+    canvas.width = current.width;
+    canvas.height = current.height;
+
+    stream = new WebSocket(
+      `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream/${sessionId}`
+    );
+
+    stream.addEventListener('message', async (event) => {
+      const message = JSON.parse(event.data);
+
+      if (message.type === 'error') {
+        state.textContent = message.message;
+        return;
+      }
+
+      if (message.type !== 'frame') {
+        return;
+      }
+
+      const image = new Image();
+
+      image.onload = () => {
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      };
+
+      image.src = `data:image/jpeg;base64,${message.data}`;
+    });
+
+    stream.addEventListener('error', () => {
+      state.textContent = 'The remote-browser input connection failed.';
+    });
+
+    stream.addEventListener('close', () => {
+      if (sessionId) {
+        state.textContent = 'The remote browser connection closed.';
+      }
+    });
+
+    await refresh();
+
+    clearInterval(refreshTimer);
+    refreshTimer = setInterval(refresh, 1400);
+  } catch (error) {
+    state.textContent = `Could not load site: ${error.message}`;
+    console.error(error);
+    throw error;
+  }
 }
 
 form.addEventListener('submit', async (event) => {
@@ -79,10 +121,16 @@ canvas.addEventListener('wheel', (event) => {
 screen.tabIndex = 0;
 
 function sendKeyEvent(event, action) {
-  if (!stream || stream.readyState !== WebSocket.OPEN) return;
+  if (!stream || stream.readyState !== WebSocket.OPEN) {
+    return;
+  }
 
-  // The canvas is a remote-browser display, so local browser behavior
-  // should not consume the keystroke before it reaches Playwright.
+  // Only intercept keyboard input when the remote browser canvas
+  // actually has focus. This keeps the local address bar editable.
+  if (document.activeElement !== screen) {
+    return;
+  }
+
   event.preventDefault();
 
   stream.send(JSON.stringify({

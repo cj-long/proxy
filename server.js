@@ -136,7 +136,7 @@ async function handleBrowserApi(request, response, requestUrl) {
     });
 
     await page.goto(target.href, {
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'commit',
       timeout: 45000
     });
 
@@ -183,7 +183,7 @@ async function handleBrowserApi(request, response, requestUrl) {
 
   if (request.method === 'POST' && action === 'navigate') {
     await session.page.goto(new URL(body.url).href, {
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'commit',
       timeout: 45000
     });
   }
@@ -191,7 +191,7 @@ async function handleBrowserApi(request, response, requestUrl) {
   if (request.method === 'POST' && action === 'back') {
     await session.page
       .goBack({
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'commit',
         timeout: 45000
       })
       .catch(() => null);
@@ -200,7 +200,7 @@ async function handleBrowserApi(request, response, requestUrl) {
   if (request.method === 'POST' && action === 'forward') {
     await session.page
       .goForward({
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'commit',
         timeout: 45000
       })
       .catch(() => null);
@@ -208,7 +208,7 @@ async function handleBrowserApi(request, response, requestUrl) {
 
   if (request.method === 'POST' && action === 'reload') {
     await session.page.reload({
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'commit',
       timeout: 45000
     });
   }
