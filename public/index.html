@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Relay // Web proxy</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div class="mark"><span></span> RELAY</div>
+        <div class="status"><i></i> READY TO FETCH</div>
+      </header>
+      <section class="hero">
+        <p class="kicker">A clear path to the open web</p>
+        <h1>Bring a site<br><em>through.</em></h1>
+        <p class="intro">Enter a public URL. Relay opens it in a real browser session so interactive and sign-in flows stay inside this window.</p>
+        <form id="proxy-form" class="url-form">
+          <label for="url">Destination URL</label>
+          <div class="input-row">
+            <input id="url" name="url" type="url" placeholder="https://example.com" autocomplete="url" required>
+            <button type="submit">Open <span aria-hidden="true">↗</span></button>
+          </div>
+          <p id="error" class="error" role="alert"></p>
+          <a class="remote-link" href="/remote">Open browser mode <span aria-hidden="true">↗</span></a>
+        </form>
+      </section>
+      <footer>
+        <span>RELAY / 01</span>
+        <span>PUBLIC URLS ONLY</span>
+      </footer>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

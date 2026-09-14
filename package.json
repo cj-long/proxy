@@ -1,0 +1,13 @@
+{
+  "name": "web-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small browser-facing web proxy with HTML rewriting.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0",
+    "ws": "^8.21.3"
+  }
+}

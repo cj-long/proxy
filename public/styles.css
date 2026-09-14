@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;600;700;800&display=swap');
+
+:root { --ink: #17221f; --paper: #f0eee8; --acid: #d7f35b; --line: #c4c4b9; --muted: #66716b; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: var(--paper); color: var(--ink); font-family: Manrope, sans-serif; }
+.shell { width: min(1180px, calc(100% - 48px)); min-height: 100vh; margin: auto; display: flex; flex-direction: column; }
+.masthead, footer { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); padding: 26px 0; font: 500 11px 'DM Mono', monospace; letter-spacing: .12em; }
+.mark { font-weight: 500; letter-spacing: .2em; }
+.mark span { display: inline-block; width: 10px; height: 10px; margin-right: 8px; background: var(--acid); border: 1px solid var(--ink); border-radius: 50%; }
+.status { color: var(--muted); }
+.status i { display: inline-block; width: 7px; height: 7px; margin-right: 7px; background: #63b96b; border-radius: 50%; }
+.hero { flex: 1; display: grid; grid-template-columns: 1fr minmax(320px, 470px); gap: 10%; align-content: center; padding: 90px 0 120px; }
+.kicker { margin: 0 0 25px; color: var(--muted); font: 500 12px 'DM Mono', monospace; letter-spacing: .08em; text-transform: uppercase; }
+h1 { margin: 0; font-size: clamp(64px, 10vw, 142px); line-height: .84; letter-spacing: -.07em; font-weight: 800; }
+h1 em { color: #778b36; font-style: normal; }
+.intro { max-width: 350px; margin: 43px 0 0; color: var(--muted); font-size: 16px; line-height: 1.65; }
+.url-form { align-self: end; padding-bottom: 12px; }
+label { display: block; margin-bottom: 12px; font: 500 11px 'DM Mono', monospace; letter-spacing: .1em; text-transform: uppercase; }
+.input-row { display: flex; border-bottom: 2px solid var(--ink); }
+input { min-width: 0; flex: 1; border: 0; outline: 0; padding: 16px 5px 16px 0; background: transparent; color: var(--ink); font: 16px Manrope, sans-serif; }
+input::placeholder { color: #9ba099; }
+button { border: 0; padding: 0 22px; background: var(--acid); color: var(--ink); font: 700 13px Manrope, sans-serif; cursor: pointer; }
+button span { margin-left: 12px; font-size: 20px; vertical-align: -1px; }
+button:hover { background: var(--ink); color: var(--acid); }
+.error { min-height: 20px; margin: 15px 0 0; color: #a64132; font-size: 13px; }
+.remote-link { display: inline-block; margin-top: 8px; color: var(--muted); font: 500 11px 'DM Mono', monospace; letter-spacing: .04em; text-decoration: none; text-transform: uppercase; }
+.remote-link:hover { color: var(--ink); }
+footer { border-top: 1px solid var(--line); border-bottom: 0; color: var(--muted); }
+@media (max-width: 700px) { .shell { width: min(100% - 32px, 560px); } .masthead { padding: 20px 0; } .hero { display: block; padding: 75px 0 100px; } h1 { font-size: clamp(64px, 20vw, 110px); } .intro { margin-top: 34px; } .url-form { margin-top: 80px; } .input-row { display: block; border: 0; } input { width: 100%; border-bottom: 2px solid var(--ink); } button { width: 100%; margin-top: 14px; padding: 16px; } footer { padding: 20px 0; } }
