@@ -911,51 +911,64 @@ streamServer.on('connection', (socket, request, session) => {
 
       if (event.type === 'key') {
         const modifiers =
-          (event.altKey ? 1 : 0) |
-          (event.ctrlKey ? 2 : 0) |
-          (event.metaKey ? 4 : 0) |
-          (event.shiftKey ? 8 : 0);
+        (event.altKey ? 1 : 0) |
+        (event.ctrlKey ? 2 : 0) |
+        (event.metaKey ? 4 : 0) |
+        (event.shiftKey ? 8 : 0);
 
         const keyDown = event.action === 'keyDown';
 
         const isPrintable =
-          typeof event.key === 'string' &&
-          event.key.length === 1 &&
-          !event.ctrlKey &&
-          !event.altKey &&
-          !event.metaKey;
+        typeof event.key === 'string' &&
+        event.key.length === 1 &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey;
 
+  /*
+   * Text characters—including punctuation such as "."—are sent with
+   * CDP's `char` event. Do not assign them a Windows virtual-key code:
+   * ASCII "." is 46, which CDP interprets as the Delete key.
+   */
+          if (keyDown && isPrintable) {
+            await session.cdp.send('Input.dispatchKeyEvent', {
+              type: 'char',
+              text: event.key,
+              unmodifiedText: event.key,
+              modifiers
+            });
+
+          return;
+        }
+
+  /*
+   * A printable key-up has no remote editing work to perform. The text
+   * was already inserted by its `char` event above.
+   */
+        if (!keyDown && isPrintable) {
+          return;
+        }
+
+  /*
+   * Non-printing keys need CDP's low-level event path so controls,
+   * text fields, cursor navigation, and deletion behave normally.
+   */
         const virtualKey = virtualKeyCode(event);
 
         await session.cdp.send('Input.dispatchKeyEvent', {
-          /*
-           * Printable characters use "keyDown" so the CDP text payload
-           * inserts them. Navigation/editing keys use "rawKeyDown".
-           */
-          type: keyDown
-            ? (isPrintable ? 'keyDown' : 'rawKeyDown')
-            : 'keyUp',
-
+          type: keyDown ? 'rawKeyDown' : 'keyUp',
           key: String(event.key || ''),
           code: String(event.code || ''),
-
           windowsVirtualKeyCode: virtualKey,
           nativeVirtualKeyCode: virtualKey,
-
           location: Number(event.location || 0),
           modifiers,
-          autoRepeat: Boolean(event.repeat),
-
-          ...(keyDown && isPrintable
-            ? {
-                text: event.key,
-                unmodifiedText: event.key
-              }
-            : {})
+          autoRepeat: Boolean(event.repeat)
         });
 
         return;
       }
+
     } catch {
       if (socket.readyState === 1) {
         socket.send(JSON.stringify({
