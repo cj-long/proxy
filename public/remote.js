@@ -77,13 +77,36 @@ canvas.addEventListener('wheel', (event) => {
 }, { passive: false });
 
 screen.tabIndex = 0;
-screen.addEventListener('keydown', async (event) => {
-  if (!stream) return;
-  if (event.key === 'Tab') event.preventDefault();
-  stream.send(JSON.stringify({ type: 'key', action: 'keyDown', key: event.key, code: event.code }));
+
+function sendKeyEvent(event, action) {
+  if (!stream || stream.readyState !== WebSocket.OPEN) return;
+
+  // The canvas is a remote-browser display, so local browser behavior
+  // should not consume the keystroke before it reaches Playwright.
+  event.preventDefault();
+
+  stream.send(JSON.stringify({
+    type: 'key',
+    action,
+    key: event.key,
+    code: event.code,
+    keyCode: event.keyCode,
+    which: event.which,
+    location: event.location,
+    repeat: event.repeat,
+    ctrlKey: event.ctrlKey,
+    altKey: event.altKey,
+    shiftKey: event.shiftKey,
+    metaKey: event.metaKey
+  }));
+}
+
+screen.addEventListener('keydown', (event) => {
+  sendKeyEvent(event, 'keyDown');
 });
+
 screen.addEventListener('keyup', (event) => {
-  if (stream) stream.send(JSON.stringify({ type: 'key', action: 'keyUp', key: event.key, code: event.code }));
+  sendKeyEvent(event, 'keyUp');
 });
 
 for (const [name, action] of [['back', 'back'], ['forward', 'forward'], ['reload', 'reload']]) {
