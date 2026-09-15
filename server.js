@@ -9,12 +9,21 @@ const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const PROFILE_DIR = path.join(__dirname, '.browser-profile');
+const PROFILE_LOCK = 'persistent-profile';
 const sessions = new Map();
 
 let browserPromise;
 
 function getBrowser() {
-  browserPromise ||= chromium.launch({ headless: true });
+  browserPromise ||= chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: true,
+    viewport: {
+      width: 1280,
+      height: 800
+    }
+  });
+
   return browserPromise;
 }
 
@@ -86,15 +95,7 @@ async function handleBrowserApi(request, response, requestUrl) {
       throw new Error('Only http:// and https:// URLs are supported.');
     }
 
-    const browser = await getBrowser();
-
-    const context = await browser.newContext({
-      viewport: {
-        width: 1280,
-        height: 800
-      }
-    });
-
+    const context = await getBrowser();
     const page = await context.newPage();
     const cdp = await context.newCDPSession(page);
     const id = crypto.randomUUID();
@@ -173,7 +174,7 @@ async function handleBrowserApi(request, response, requestUrl) {
   }
 
   if (request.method === 'DELETE' && !action) {
-    await session.context.close();
+    await session.page.close().catch(() => null);
     sessions.delete(id);
 
     return sendJson(response, 200, { ok: true });
