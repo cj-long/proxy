@@ -3,38 +3,65 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Video Viewer</title>
+    <title>Relay // Browser mode</title>
     <link rel="stylesheet" href="/remote.css">
   </head>
   <body>
     <main class="browser-shell">
       <header class="toolbar">
         <a class="brand" href="/">RELAY <span>/ BROWSER</span></a>
+
         <nav class="browser-nav" aria-label="Browser controls">
           <button id="back" type="button" title="Back" aria-label="Back">←</button>
           <button id="forward" type="button" title="Forward" aria-label="Forward">→</button>
           <button id="reload" type="button" title="Reload" aria-label="Reload">↻</button>
           <button id="fullscreen" type="button" title="Full screen" aria-label="Full screen">⛶</button>
         </nav>
+
         <form id="navigate-form" class="address-bar">
-          <input id="address" type="url" placeholder="https://www.xbox.com" required>
-          <button>Go</button>
+          <input
+            id="address"
+            type="url"
+            placeholder="https://example.com"
+            autocomplete="url"
+            required
+          >
+          <button type="submit">Go</button>
         </form>
+
         <div id="state" class="state">NO SESSION</div>
       </header>
+
       <section class="stage">
         <div id="empty" class="empty">
           <p class="eyebrow">REAL BROWSER SESSION</p>
           <h1>Open a site<br><em>as itself.</em></h1>
-          <p>Relay controls a real Chromium session here. Cookies, redirects, JavaScript, and sign-in flows stay inside the browser context.</p>
+          <p>
+            Relay controls a real Chromium session. Cookies, redirects,
+            JavaScript, and sign-in flows stay inside the browser context.
+          </p>
         </div>
-        <canvas id="screen" aria-label="Live remote browser viewport" hidden></canvas>
+
+        <canvas
+          id="screen"
+          aria-label="Live remote browser viewport"
+          hidden
+        ></canvas>
       </section>
+
       <footer class="controls">
         <span><i></i> LIVE BROWSER SESSION</span>
         <span class="hint">CLICK AND TYPE DIRECTLY IN THE VIEWPORT</span>
       </footer>
     </main>
+
+    <input
+      id="local-file-picker"
+      type="file"
+      hidden
+      multiple
+    >
+
     <script src="/remote.js"></script>
   </body>
 </html>
