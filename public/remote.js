@@ -145,10 +145,15 @@ async function playRemoteAudio(data) {
   source.buffer = audioBuffer;
   source.connect(audioContext.destination);
 
-  remoteAudioTime = Math.max(
-    remoteAudioTime,
-    audioContext.currentTime + 0.03
-  );
+  const currentAudioTime = audioContext.currentTime;
+
+  if (
+    remoteAudioTime < currentAudioTime ||
+    remoteAudioTime > currentAudioTime + 0.12
+  ) {
+    remoteAudioTime = currentAudioTime + 0.02;
+  }
+
   source.start(remoteAudioTime);
   remoteAudioTime += audioBuffer.duration;
 }
@@ -243,7 +248,7 @@ microphoneButton.addEventListener('click', async () => {
 
     microphoneAnalyser = microphoneContext.createAnalyser();
     microphoneAnalyser.fftSize = 1024;
-    microphoneProcessor = microphoneContext.createScriptProcessor(4096, 1, 1);
+    microphoneProcessor = microphoneContext.createScriptProcessor(1024, 1, 1);
     microphoneMuteGain = microphoneContext.createGain();
     microphoneMuteGain.gain.value = 0;
 

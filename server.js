@@ -283,6 +283,7 @@ function setupAudioOutput() {
       '--format=s16le',
       '--rate=48000',
       '--channels=1',
+      '--latency-msec=20',
       '--raw'
     ], {
       stdio: ['pipe', 'ignore', 'ignore'],
@@ -301,6 +302,7 @@ function setupAudioOutput() {
       '--format=s16le',
       '--rate=48000',
       '--channels=2',
+      '--latency-msec=20',
       '--raw'
     ], {
       stdio: ['ignore', 'pipe', 'ignore'],
