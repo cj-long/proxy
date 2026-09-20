@@ -3,12 +3,14 @@ const crypto = require('node:crypto');
 const dns = require('node:dns').promises;
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync, spawn } = require('node:child_process');
 const { URL } = require('node:url');
 const { chromium } = require('playwright');
 const { WebSocketServer } = require('ws');
 const Busboy = require('busboy');
 
 const PORT = Number(process.env.PORT || 3000);
+const HEADLESS = process.env.HEADLESS !== 'false';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROFILE_DIR = path.join(__dirname, '.browser-profile');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -21,10 +23,163 @@ const sessions = new Map();
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 let browserContextPromise;
+let audioModuleId = null;
+let audioInputModuleId = null;
+let audioInputSourceModuleId = null;
+let audioCaptureProcess = null;
+let audioInputProcess = null;
+let microphoneBytesWritten = 0;
+const AUDIO_SINK = 'relay_output';
+const AUDIO_INPUT_SINK = 'relay_input';
+const AUDIO_INPUT_SOURCE = 'relay_microphone';
+
+const AUDIO_BRIDGE_SCRIPT = `
+  (() => {
+    let remoteStream = null;
+    let audioPeer = null;
+    const pendingAudioRequests = [];
+
+    function sendSignal(signal) {
+      window.relayAudioSignal(signal).catch(() => {});
+    }
+
+    function waitForIceGatheringComplete(peerConnection) {
+      if (peerConnection.iceGatheringState === 'complete') {
+        return Promise.resolve();
+      }
+
+      return new Promise((resolve) => {
+        peerConnection.addEventListener('icegatheringstatechange', () => {
+          if (peerConnection.iceGatheringState === 'complete') {
+            resolve();
+          }
+        });
+      });
+    }
+
+    function resolveAudioRequests() {
+      if (!remoteStream) {
+        return;
+      }
+
+      while (pendingAudioRequests.length > 0) {
+        pendingAudioRequests.shift()(remoteStream);
+      }
+    }
+
+    async function reportAudioStats() {
+      if (!audioPeer) {
+        return;
+      }
+
+      const reports = await audioPeer.getStats();
+      let bytesReceived = 0;
+
+      for (const report of reports.values()) {
+        if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+          bytesReceived += report.bytesReceived || 0;
+        }
+      }
+
+      sendSignal({
+        kind: 'microphone-status',
+        state: audioPeer.connectionState,
+        bytesReceived
+      });
+    }
+
+    window.__relayReceiveAudioSignal = async (signal) => {
+      if (signal.kind !== 'microphone') {
+        return;
+      }
+
+      audioPeer ??= new RTCPeerConnection();
+      audioPeer.ontrack = (event) => {
+        event.track.enabled = true;
+        remoteStream = event.streams[0] || new MediaStream();
+
+        if (remoteStream.getAudioTracks().length === 0) {
+          remoteStream.addTrack(event.track);
+        }
+
+        resolveAudioRequests();
+      };
+      audioPeer.onconnectionstatechange = () => {
+        sendSignal({
+          kind: 'microphone-status',
+          state: audioPeer.connectionState
+        });
+      };
+
+      setInterval(() => {
+        reportAudioStats().catch(() => {});
+      }, 1000);
+
+      await audioPeer.setRemoteDescription(signal.description);
+
+      if (signal.description.type === 'offer') {
+        const answer = await audioPeer.createAnswer();
+        await audioPeer.setLocalDescription(answer);
+        await waitForIceGatheringComplete(audioPeer);
+        sendSignal({
+          kind: 'microphone',
+          description: audioPeer.localDescription
+        });
+      }
+    };
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return;
+    }
+
+    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(
+      navigator.mediaDevices
+    );
+    const originalEnumerateDevices =
+      navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+
+    navigator.mediaDevices.enumerateDevices = async () => {
+      const devices = await originalEnumerateDevices();
+
+      if (devices.some((device) => device.kind === 'audioinput')) {
+        return devices;
+      }
+
+      return [
+        {
+          deviceId: 'relay-microphone',
+          groupId: 'relay-audio',
+          kind: 'audioinput',
+          label: 'Relay Microphone'
+        },
+        ...devices
+      ];
+    };
+
+    navigator.mediaDevices.getUserMedia = (constraints) => {
+      if (!constraints?.audio) {
+        return originalGetUserMedia(constraints);
+      }
+
+      if (remoteStream) {
+        return Promise.resolve(remoteStream);
+      }
+
+      return new Promise((resolve) => {
+        pendingAudioRequests.push(resolve);
+      });
+    };
+  })();
+`;
 
 function getBrowserContext() {
   browserContextPromise ||= chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: true,
+    headless: HEADLESS,
+    env: {
+      ...process.env,
+      PULSE_SINK: AUDIO_SINK,
+      PULSE_SOURCE: AUDIO_INPUT_SOURCE
+    },
     viewport: {
       width: 1280,
       height: 800
@@ -32,6 +187,159 @@ function getBrowserContext() {
   });
 
   return browserContextPromise;
+}
+
+function writeMicrophoneAudio(chunk) {
+  if (audioInputProcess?.stdin.writable) {
+    if (audioInputProcess.stdin.write(chunk)) {
+      microphoneBytesWritten += chunk.length;
+    }
+  }
+}
+
+function broadcastAudio(chunk) {
+  for (const session of sessions.values()) {
+    for (const client of session.clients) {
+      if (client.readyState === 1) {
+        client.send(chunk);
+      }
+    }
+  }
+}
+
+function setupAudioOutput() {
+  if (process.env.AUDIO_CAPTURE === 'false') {
+    return;
+  }
+
+  try {
+    execFileSync('pulseaudio', [
+      '--start',
+      '--exit-idle-time=-1'
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', ['info'], { stdio: 'ignore' });
+
+    const sinks = execFileSync('pactl', ['list', 'short', 'sinks'], {
+      encoding: 'utf8'
+    });
+
+    if (!sinks.split('\n').some((line) => line.includes(AUDIO_SINK))) {
+      audioModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-null-sink',
+        `sink_name=${AUDIO_SINK}`,
+        `sink_properties=device.description=RelayOutput`
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    const inputSinks = execFileSync('pactl', ['list', 'short', 'sinks'], {
+      encoding: 'utf8'
+    });
+    if (!inputSinks.split('\n').some((line) => line.includes(AUDIO_INPUT_SINK))) {
+      audioInputModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-null-sink',
+        `sink_name=${AUDIO_INPUT_SINK}`,
+        'sink_properties=device.description=RelayMicrophoneInput'
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    const sources = execFileSync('pactl', ['list', 'short', 'sources'], {
+      encoding: 'utf8'
+    });
+
+    if (!sources.split('\n').some((line) => line.includes(AUDIO_INPUT_SOURCE))) {
+      audioInputSourceModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-remap-source',
+        `master=${AUDIO_INPUT_SINK}.monitor`,
+        `source_name=${AUDIO_INPUT_SOURCE}`,
+        'source_properties=device.description=RelayMicrophone',
+        'remix=no'
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    execFileSync('pactl', [
+      'set-default-sink',
+      AUDIO_SINK
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-default-source',
+      AUDIO_INPUT_SOURCE
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-source-mute',
+      AUDIO_INPUT_SOURCE,
+      '0'
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-source-volume',
+      AUDIO_INPUT_SOURCE,
+      '100%'
+    ], { stdio: 'ignore' });
+
+    audioInputProcess = spawn('pacat', [
+      `--device=${AUDIO_INPUT_SINK}`,
+      '--format=s16le',
+      '--rate=48000',
+      '--channels=1',
+      '--raw'
+    ], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: process.env
+    });
+
+    audioInputProcess.on('error', () => {
+      audioInputProcess = null;
+    });
+    audioInputProcess.stdin.on('error', () => {
+      audioInputProcess = null;
+    });
+
+    audioCaptureProcess = spawn('parec', [
+      `--device=${AUDIO_SINK}.monitor`,
+      '--format=s16le',
+      '--rate=48000',
+      '--channels=2',
+      '--raw'
+    ], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: process.env
+    });
+
+    audioCaptureProcess.stdout.on('data', broadcastAudio);
+    audioCaptureProcess.on('error', () => {
+      audioCaptureProcess = null;
+    });
+    console.log('Remote audio capture enabled.');
+  } catch {
+    console.warn(
+      'Remote audio capture unavailable. Install PulseAudio tools or set AUDIO_CAPTURE=false.'
+    );
+  }
+}
+
+function stopAudioOutput() {
+  audioCaptureProcess?.kill();
+  audioInputProcess?.kill();
+
+  for (const moduleId of [
+    audioModuleId,
+    audioInputModuleId,
+    audioInputSourceModuleId
+  ]) {
+    if (!moduleId) {
+      continue;
+    }
+
+    try {
+      execFileSync('pactl', ['unload-module', moduleId], {
+        stdio: 'ignore'
+      });
+    } catch {
+      // The audio server may already be gone during process shutdown.
+    }
+  }
 }
 
 function sendJson(response, status, value) {
@@ -263,6 +571,8 @@ async function createBrowserSession(target) {
   };
 
   sessions.set(id, session);
+
+  await context.grantPermissions(['microphone']);
 
   page.on('filechooser', (fileChooser) => {
     session.pendingFileChooser = fileChooser;
@@ -830,9 +1140,22 @@ streamServer.on('connection', (socket, request, session) => {
     session.clients.delete(socket);
   });
 
-  socket.on('message', async (message) => {
+  socket.on('message', async (message, isBinary) => {
     try {
+      if (isBinary) {
+        writeMicrophoneAudio(message);
+        return;
+      }
+
       const event = JSON.parse(message.toString());
+
+      if (event.type === 'audio-signal') {
+        await session.page.evaluate(async (signal) => {
+          await window.__relayReceiveAudioSignal?.(signal);
+        }, event.signal);
+
+        return;
+      }
 
       if (event.type === 'mouse') {
         await session.cdp.send('Input.dispatchMouseEvent', {
@@ -954,5 +1277,8 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 server.listen(PORT, () => {
+  setupAudioOutput();
   console.log(`Web proxy running at http://localhost:${PORT}`);
 });
+
+process.on('exit', stopAudioOutput);

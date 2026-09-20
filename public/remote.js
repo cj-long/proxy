@@ -24,6 +24,79 @@ let microphoneStream = null;
 let microphoneContext = null;
 let microphoneAnalyser = null;
 let microphoneMeterFrame = null;
+let microphoneProcessor = null;
+let microphoneMuteGain = null;
+let audioPeerConnection = null;
+let remoteAudioTime = 0;
+let audioStatsTimer = null;
+let microphoneFrameCount = 0;
+let microphoneRms = 0;
+
+function waitForIceGatheringComplete(peerConnection) {
+  if (peerConnection.iceGatheringState === 'complete') {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    peerConnection.addEventListener('icegatheringstatechange', () => {
+      if (peerConnection.iceGatheringState === 'complete') {
+        resolve();
+      }
+    });
+  });
+}
+
+async function startAudioBridge() {
+  if (audioPeerConnection) {
+    audioPeerConnection.close();
+  }
+
+  audioPeerConnection = new RTCPeerConnection();
+  audioPeerConnection.onconnectionstatechange = () => {
+    const connectionState = audioPeerConnection.connectionState;
+
+    micStatus.textContent = connectionState === 'connected'
+      ? 'Mic connected'
+      : `Mic ${connectionState}`;
+  };
+
+  for (const track of microphoneStream.getTracks()) {
+    track.enabled = true;
+    track.contentHint = 'speech';
+    audioPeerConnection.addTrack(track, microphoneStream);
+  }
+
+  audioStatsTimer = setInterval(async () => {
+    if (!audioPeerConnection) {
+      return;
+    }
+
+    const reports = await audioPeerConnection.getStats();
+    let bytesSent = 0;
+
+    for (const report of reports.values()) {
+      if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+        bytesSent += report.bytesSent || 0;
+      }
+    }
+
+    if (bytesSent > 0) {
+      micStatus.textContent = 'Mic audio flowing';
+    }
+  }, 1000);
+
+  const offer = await audioPeerConnection.createOffer();
+  await audioPeerConnection.setLocalDescription(offer);
+  await waitForIceGatheringComplete(audioPeerConnection);
+
+  sendStreamEvent({
+    type: 'audio-signal',
+    signal: {
+      kind: 'microphone',
+      description: audioPeerConnection.localDescription
+    }
+  });
+}
 
 function playAlertTone() {
   if (!soundEnabled || !audioContext) {
@@ -49,6 +122,37 @@ function playAlertTone() {
   oscillator.stop(now + 0.31);
 }
 
+async function playRemoteAudio(data) {
+  if (!soundEnabled || !audioContext) {
+    return;
+  }
+
+  const arrayBuffer = await data.arrayBuffer();
+  const sampleCount = Math.floor(arrayBuffer.byteLength / 2);
+  const samples = new Int16Array(arrayBuffer, 0, sampleCount);
+  const frameCount = Math.floor(samples.length / 2);
+  const audioBuffer = audioContext.createBuffer(2, frameCount, 48000);
+
+  for (let channel = 0; channel < 2; channel += 1) {
+    const output = audioBuffer.getChannelData(channel);
+
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      output[frame] = samples[frame * 2 + channel] / 32768;
+    }
+  }
+
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+
+  remoteAudioTime = Math.max(
+    remoteAudioTime,
+    audioContext.currentTime + 0.03
+  );
+  source.start(remoteAudioTime);
+  remoteAudioTime += audioBuffer.duration;
+}
+
 function stopMicrophone() {
   if (microphoneMeterFrame) {
     cancelAnimationFrame(microphoneMeterFrame);
@@ -62,6 +166,22 @@ function stopMicrophone() {
   }
 
   microphoneStream = null;
+
+  microphoneProcessor?.disconnect();
+  microphoneMuteGain?.disconnect();
+  microphoneProcessor = null;
+  microphoneMuteGain = null;
+
+  if (audioPeerConnection) {
+    audioPeerConnection.close();
+    audioPeerConnection = null;
+  }
+
+  if (audioStatsTimer) {
+    clearInterval(audioStatsTimer);
+    audioStatsTimer = null;
+  }
+
   microphoneAnalyser = null;
 
   if (microphoneContext) {
@@ -109,22 +229,50 @@ soundButton.addEventListener('click', async () => {
 microphoneButton.addEventListener('click', async () => {
   try {
     micStatus.textContent = 'Requesting mic…';
+    microphoneFrameCount = 0;
 
     microphoneStream = await navigator.mediaDevices.getUserMedia({
       audio: true
     });
 
-    microphoneContext = new AudioContext();
+    microphoneContext = new AudioContext({ sampleRate: 48000 });
+    await microphoneContext.resume();
     const source = microphoneContext.createMediaStreamSource(
       microphoneStream
     );
 
     microphoneAnalyser = microphoneContext.createAnalyser();
     microphoneAnalyser.fftSize = 1024;
+    microphoneProcessor = microphoneContext.createScriptProcessor(4096, 1, 1);
+    microphoneMuteGain = microphoneContext.createGain();
+    microphoneMuteGain.gain.value = 0;
 
     source.connect(microphoneAnalyser);
+    source.connect(microphoneProcessor);
+    microphoneProcessor.connect(microphoneMuteGain);
+    microphoneMuteGain.connect(microphoneContext.destination);
 
-    micStatus.textContent = 'Mic live (local only)';
+    microphoneProcessor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      const samples = new Int16Array(input.length);
+      let energy = 0;
+
+      for (let index = 0; index < input.length; index += 1) {
+        const sample = Math.max(-1, Math.min(1, input[index]));
+        energy += sample * sample;
+        samples[index] = sample < 0 ? sample * 32768 : sample * 32767;
+      }
+
+      sendStreamAudio(samples.buffer);
+      microphoneFrameCount += 1;
+      microphoneRms = Math.sqrt(energy / input.length);
+
+      if (microphoneFrameCount % 10 === 0) {
+        micStatus.textContent = `Mic streaming (${microphoneFrameCount} frames, RMS ${microphoneRms.toFixed(3)})`;
+      }
+    };
+
+    micStatus.textContent = 'Mic streaming';
     micStatus.classList.add('live');
     microphoneButton.hidden = true;
     stopMicrophoneButton.hidden = false;
@@ -205,6 +353,11 @@ async function openBrowser(url) {
     );
 
     stream.addEventListener('message', (event) => {
+      if (typeof event.data !== 'string') {
+        playRemoteAudio(event.data).catch((error) => console.error(error));
+        return;
+      }
+
       const message = JSON.parse(event.data);
 
       if (message.type === 'frame') {
@@ -220,6 +373,28 @@ async function openBrowser(url) {
 
       if (message.type === 'fileChooser') {
         openLocalFilePicker();
+        return;
+      }
+
+      if (
+        message.type === 'audio-signal' &&
+        audioPeerConnection
+      ) {
+        if (message.signal.description?.type === 'answer') {
+          audioPeerConnection
+            .setRemoteDescription(message.signal.description)
+            .catch((error) => {
+              console.error(error);
+              micStatus.textContent = 'Mic negotiation failed';
+            });
+        }
+
+        if (message.signal.kind === 'microphone-status') {
+          micStatus.textContent = message.signal.bytesReceived > 0
+            ? 'Mic audio received'
+            : `Mic ${message.signal.state}`;
+        }
+
         return;
       }
 
@@ -278,6 +453,14 @@ function sendStreamEvent(value) {
   }
 
   stream.send(JSON.stringify(value));
+}
+
+function sendStreamAudio(value) {
+  if (!stream || stream.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  stream.send(value);
 }
 
 canvas.addEventListener('mousedown', (event) => {
