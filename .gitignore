@@ -1,2 +1,7 @@
-.browser-profile/
 node_modules/
+.browser-profile/
+uploads/
+
+.env
+.env.*
+!.env.example

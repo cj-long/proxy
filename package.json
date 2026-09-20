@@ -2,11 +2,14 @@
   "name": "web-proxy",
   "version": "1.0.0",
   "private": true,
-  "description": "A small browser-facing web proxy with HTML rewriting.",
+  "description": "A local Playwright-backed browser relay",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
+    "busboy": "^1.6.0",
     "playwright": "^1.63.0",
     "ws": "^8.21.3"
   }

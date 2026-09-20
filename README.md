@@ -18,6 +18,30 @@ Set `PORT` to use another port:
 PORT=8080 npm start
 ```
 
+The browser is headless by default. To run headed Chromium inside this
+container, start it through the installed virtual display:
+
+```bash
+xvfb-run -a env HEADLESS=false npm start
+```
+
+The **Enable mic** control streams the local microphone into a PulseAudio
+virtual capture device. Chromium uses that device as its native microphone,
+which is compatible with sites that inspect browser audio devices before
+calling `getUserMedia` for voice chat. It does not connect directly to an Xbox
+console.
+
+To return remote browser audio to the local page, install PulseAudio utilities
+in the host or container:
+
+```bash
+sudo apt-get update && sudo apt-get install -y pulseaudio pulseaudio-utils
+```
+
+Relay creates a `relay_output` virtual sink and captures its monitor at 48 kHz
+stereo. Click **Enable sound** in the relay page before opening party chat.
+Set `AUDIO_CAPTURE=false` to disable this capture path.
+
 ## Boundaries
 
 This is intended for local use or a trusted environment. It allows public targets only and rejects obvious local/private network destinations, but it is not a complete production SSRF defense. HTML rewriting is deliberately lightweight; sites that depend heavily on client-side routing, signed requests, or complex security policies may not work correctly.

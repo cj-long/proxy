@@ -3,37 +3,507 @@ const crypto = require('node:crypto');
 const dns = require('node:dns').promises;
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync, spawn } = require('node:child_process');
 const { URL } = require('node:url');
 const { chromium } = require('playwright');
 const { WebSocketServer } = require('ws');
+const Busboy = require('busboy');
 
 const PORT = Number(process.env.PORT || 3000);
+const HEADLESS = process.env.HEADLESS !== 'false';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROFILE_DIR = path.join(__dirname, '.browser-profile');
-const PROFILE_LOCK = 'persistent-profile';
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+
+const MAX_UPLOAD_SIZE = 25 * 1024 * 1024;
+const MAX_UPLOAD_FILES = 10;
+
 const sessions = new Map();
 
-let browserPromise;
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-function getBrowser() {
-  browserPromise ||= chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: true,
+let browserContextPromise;
+let audioModuleId = null;
+let audioInputModuleId = null;
+let audioInputSourceModuleId = null;
+let audioCaptureProcess = null;
+let audioInputProcess = null;
+let microphoneBytesWritten = 0;
+const AUDIO_SINK = 'relay_output';
+const AUDIO_INPUT_SINK = 'relay_input';
+const AUDIO_INPUT_SOURCE = 'relay_microphone';
+
+const AUDIO_BRIDGE_SCRIPT = `
+  (() => {
+    let remoteStream = null;
+    let audioPeer = null;
+    const pendingAudioRequests = [];
+
+    function sendSignal(signal) {
+      window.relayAudioSignal(signal).catch(() => {});
+    }
+
+    function waitForIceGatheringComplete(peerConnection) {
+      if (peerConnection.iceGatheringState === 'complete') {
+        return Promise.resolve();
+      }
+
+      return new Promise((resolve) => {
+        peerConnection.addEventListener('icegatheringstatechange', () => {
+          if (peerConnection.iceGatheringState === 'complete') {
+            resolve();
+          }
+        });
+      });
+    }
+
+    function resolveAudioRequests() {
+      if (!remoteStream) {
+        return;
+      }
+
+      while (pendingAudioRequests.length > 0) {
+        pendingAudioRequests.shift()(remoteStream);
+      }
+    }
+
+    async function reportAudioStats() {
+      if (!audioPeer) {
+        return;
+      }
+
+      const reports = await audioPeer.getStats();
+      let bytesReceived = 0;
+
+      for (const report of reports.values()) {
+        if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+          bytesReceived += report.bytesReceived || 0;
+        }
+      }
+
+      sendSignal({
+        kind: 'microphone-status',
+        state: audioPeer.connectionState,
+        bytesReceived
+      });
+    }
+
+    window.__relayReceiveAudioSignal = async (signal) => {
+      if (signal.kind !== 'microphone') {
+        return;
+      }
+
+      audioPeer ??= new RTCPeerConnection();
+      audioPeer.ontrack = (event) => {
+        event.track.enabled = true;
+        remoteStream = event.streams[0] || new MediaStream();
+
+        if (remoteStream.getAudioTracks().length === 0) {
+          remoteStream.addTrack(event.track);
+        }
+
+        resolveAudioRequests();
+      };
+      audioPeer.onconnectionstatechange = () => {
+        sendSignal({
+          kind: 'microphone-status',
+          state: audioPeer.connectionState
+        });
+      };
+
+      setInterval(() => {
+        reportAudioStats().catch(() => {});
+      }, 1000);
+
+      await audioPeer.setRemoteDescription(signal.description);
+
+      if (signal.description.type === 'offer') {
+        const answer = await audioPeer.createAnswer();
+        await audioPeer.setLocalDescription(answer);
+        await waitForIceGatheringComplete(audioPeer);
+        sendSignal({
+          kind: 'microphone',
+          description: audioPeer.localDescription
+        });
+      }
+    };
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return;
+    }
+
+    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(
+      navigator.mediaDevices
+    );
+    const originalEnumerateDevices =
+      navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+
+    navigator.mediaDevices.enumerateDevices = async () => {
+      const devices = await originalEnumerateDevices();
+
+      if (devices.some((device) => device.kind === 'audioinput')) {
+        return devices;
+      }
+
+      return [
+        {
+          deviceId: 'relay-microphone',
+          groupId: 'relay-audio',
+          kind: 'audioinput',
+          label: 'Relay Microphone'
+        },
+        ...devices
+      ];
+    };
+
+    navigator.mediaDevices.getUserMedia = (constraints) => {
+      if (!constraints?.audio) {
+        return originalGetUserMedia(constraints);
+      }
+
+      if (remoteStream) {
+        return Promise.resolve(remoteStream);
+      }
+
+      return new Promise((resolve) => {
+        pendingAudioRequests.push(resolve);
+      });
+    };
+  })();
+`;
+
+function getBrowserContext() {
+  browserContextPromise ||= chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: HEADLESS,
+    env: {
+      ...process.env,
+      PULSE_SINK: AUDIO_SINK,
+      PULSE_SOURCE: AUDIO_INPUT_SOURCE
+    },
     viewport: {
       width: 1280,
       height: 800
     }
   });
 
-  return browserPromise;
+  return browserContextPromise;
+}
+
+function writeMicrophoneAudio(chunk) {
+  if (audioInputProcess?.stdin.writable) {
+    if (audioInputProcess.stdin.write(chunk)) {
+      microphoneBytesWritten += chunk.length;
+    }
+  }
+}
+
+function broadcastAudio(chunk) {
+  for (const session of sessions.values()) {
+    for (const client of session.clients) {
+      if (client.readyState === 1) {
+        client.send(chunk);
+      }
+    }
+  }
+}
+
+function setupAudioOutput() {
+  if (process.env.AUDIO_CAPTURE === 'false') {
+    return;
+  }
+
+  try {
+    execFileSync('pulseaudio', [
+      '--start',
+      '--exit-idle-time=-1'
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', ['info'], { stdio: 'ignore' });
+
+    const sinks = execFileSync('pactl', ['list', 'short', 'sinks'], {
+      encoding: 'utf8'
+    });
+
+    if (!sinks.split('\n').some((line) => line.includes(AUDIO_SINK))) {
+      audioModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-null-sink',
+        `sink_name=${AUDIO_SINK}`,
+        `sink_properties=device.description=RelayOutput`
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    const inputSinks = execFileSync('pactl', ['list', 'short', 'sinks'], {
+      encoding: 'utf8'
+    });
+    if (!inputSinks.split('\n').some((line) => line.includes(AUDIO_INPUT_SINK))) {
+      audioInputModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-null-sink',
+        `sink_name=${AUDIO_INPUT_SINK}`,
+        'sink_properties=device.description=RelayMicrophoneInput'
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    const sources = execFileSync('pactl', ['list', 'short', 'sources'], {
+      encoding: 'utf8'
+    });
+
+    if (!sources.split('\n').some((line) => line.includes(AUDIO_INPUT_SOURCE))) {
+      audioInputSourceModuleId = execFileSync('pactl', [
+        'load-module',
+        'module-remap-source',
+        `master=${AUDIO_INPUT_SINK}.monitor`,
+        `source_name=${AUDIO_INPUT_SOURCE}`,
+        'source_properties=device.description=RelayMicrophone',
+        'remix=no'
+      ], { encoding: 'utf8' }).trim();
+    }
+
+    execFileSync('pactl', [
+      'set-default-sink',
+      AUDIO_SINK
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-default-source',
+      AUDIO_INPUT_SOURCE
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-source-mute',
+      AUDIO_INPUT_SOURCE,
+      '0'
+    ], { stdio: 'ignore' });
+    execFileSync('pactl', [
+      'set-source-volume',
+      AUDIO_INPUT_SOURCE,
+      '100%'
+    ], { stdio: 'ignore' });
+
+    audioInputProcess = spawn('pacat', [
+      `--device=${AUDIO_INPUT_SINK}`,
+      '--format=s16le',
+      '--rate=48000',
+      '--channels=1',
+      '--latency-msec=20',
+      '--raw'
+    ], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: process.env
+    });
+
+    audioInputProcess.on('error', () => {
+      audioInputProcess = null;
+    });
+    audioInputProcess.stdin.on('error', () => {
+      audioInputProcess = null;
+    });
+
+    audioCaptureProcess = spawn('parec', [
+      `--device=${AUDIO_SINK}.monitor`,
+      '--format=s16le',
+      '--rate=48000',
+      '--channels=2',
+      '--latency-msec=20',
+      '--raw'
+    ], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: process.env
+    });
+
+    audioCaptureProcess.stdout.on('data', broadcastAudio);
+    audioCaptureProcess.on('error', () => {
+      audioCaptureProcess = null;
+    });
+    console.log('Remote audio capture enabled.');
+  } catch {
+    console.warn(
+      'Remote audio capture unavailable. Install PulseAudio tools or set AUDIO_CAPTURE=false.'
+    );
+  }
+}
+
+function stopAudioOutput() {
+  audioCaptureProcess?.kill();
+  audioInputProcess?.kill();
+
+  for (const moduleId of [
+    audioModuleId,
+    audioInputModuleId,
+    audioInputSourceModuleId
+  ]) {
+    if (!moduleId) {
+      continue;
+    }
+
+    try {
+      execFileSync('pactl', ['unload-module', moduleId], {
+        stdio: 'ignore'
+      });
+    } catch {
+      // The audio server may already be gone during process shutdown.
+    }
+  }
 }
 
 function sendJson(response, status, value) {
+  if (response.headersSent) {
+    return;
+  }
+
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store'
   });
 
   response.end(JSON.stringify(value));
+}
+
+function serveFile(response, fileName, contentType, extraHeaders = {}) {
+  response.writeHead(200, {
+    'Content-Type': contentType,
+    ...extraHeaders
+  });
+
+  fs.createReadStream(path.join(PUBLIC_DIR, fileName)).pipe(response);
+}
+
+function safeUploadName(name) {
+  return path.basename(name || 'upload');
+}
+
+function deleteTemporaryUploads(files) {
+  for (const file of files) {
+    if (file?.path) {
+      fs.unlink(file.path, () => {});
+    }
+  }
+}
+
+function receiveUpload(request) {
+  return new Promise((resolve, reject) => {
+    const contentType = request.headers['content-type'] || '';
+
+    if (!contentType.startsWith('multipart/form-data')) {
+      reject(new Error('Expected a multipart file upload.'));
+      return;
+    }
+
+    const busboy = Busboy({
+      headers: request.headers,
+      limits: {
+        fileSize: MAX_UPLOAD_SIZE,
+        files: MAX_UPLOAD_FILES
+      }
+    });
+
+    const files = [];
+    const pendingPaths = new Set();
+
+    let settled = false;
+    let parsingFinished = false;
+    let pendingWrites = 0;
+
+    function cleanup() {
+      deleteTemporaryUploads(files);
+
+      for (const filePath of pendingPaths) {
+        fs.unlink(filePath, () => {});
+      }
+    }
+
+    function fail(error) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      reject(error);
+    }
+
+    function finishIfReady() {
+      if (!settled && parsingFinished && pendingWrites === 0) {
+        settled = true;
+        resolve(files);
+      }
+    }
+
+    busboy.on('file', (fieldName, file, info) => {
+      if (fieldName !== 'files') {
+        file.resume();
+        return;
+      }
+
+      pendingWrites += 1;
+
+      const originalName = safeUploadName(info.filename);
+      const filePath = path.join(
+        UPLOAD_DIR,
+        `${crypto.randomUUID()}-${originalName}`
+      );
+
+      pendingPaths.add(filePath);
+
+      const output = fs.createWriteStream(filePath);
+
+      let size = 0;
+      let exceededLimit = false;
+
+      file.on('data', (chunk) => {
+        size += chunk.length;
+      });
+
+      file.on('limit', () => {
+        exceededLimit = true;
+      });
+
+      file.on('error', fail);
+      output.on('error', fail);
+
+      output.on('finish', () => {
+        pendingWrites -= 1;
+        pendingPaths.delete(filePath);
+
+        if (settled) {
+          fs.unlink(filePath, () => {});
+          return;
+        }
+
+        if (exceededLimit) {
+          fs.unlink(filePath, () => {});
+          fail(
+            new Error(
+              `A selected file exceeds the ${MAX_UPLOAD_SIZE / 1024 / 1024} MB limit.`
+            )
+          );
+          return;
+        }
+
+        files.push({
+          path: filePath,
+          name: originalName,
+          size
+        });
+
+        finishIfReady();
+      });
+
+      file.pipe(output);
+    });
+
+    busboy.on('filesLimit', () => {
+      fail(new Error(`Select no more than ${MAX_UPLOAD_FILES} files.`));
+    });
+
+    busboy.on('error', fail);
+
+    busboy.on('finish', () => {
+      parsingFinished = true;
+      finishIfReady();
+    });
+
+    request.on('error', fail);
+    request.pipe(busboy);
+  });
 }
 
 async function parseJson(request) {
@@ -44,15 +514,6 @@ async function parseJson(request) {
   }
 
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-}
-
-function serveFile(response, fileName, contentType, extraHeaders = {}) {
-  response.writeHead(200, {
-    'Content-Type': contentType,
-    ...extraHeaders
-  });
-
-  fs.createReadStream(path.join(PUBLIC_DIR, fileName)).pipe(response);
 }
 
 function sessionFor(requestUrl) {
@@ -86,6 +547,93 @@ async function sessionState(session) {
   };
 }
 
+function broadcast(session, value) {
+  const message = JSON.stringify(value);
+
+  for (const client of session.clients) {
+    if (client.readyState === 1) {
+      client.send(message);
+    }
+  }
+}
+
+async function createBrowserSession(target) {
+  const context = await getBrowserContext();
+  const page = await context.newPage();
+  const cdp = await context.newCDPSession(page);
+  const id = crypto.randomUUID();
+
+  const session = {
+    context,
+    page,
+    cdp,
+    clients: new Set(),
+    pendingFileChooser: null,
+    uploadedFiles: []
+  };
+
+  sessions.set(id, session);
+
+  await context.grantPermissions(['microphone']);
+
+  page.on('filechooser', (fileChooser) => {
+    session.pendingFileChooser = fileChooser;
+    broadcast(session, { type: 'fileChooser' });
+  });
+
+  page.on('close', () => {
+    deleteTemporaryUploads(session.uploadedFiles);
+    sessions.delete(id);
+  });
+
+  page.on('requestfailed', (request) => {
+    console.log(
+      `[network failed] ${request.resourceType()} ${request.url()} :: ${
+        request.failure()?.errorText || 'unknown error'
+      }`
+    );
+  });
+
+  page.on('response', (response) => {
+    const type = response.request().resourceType();
+
+    if (response.status() >= 400 || type === 'image') {
+      console.log(
+        `[network] ${response.status()} ${type} ${response.url()}`
+      );
+    }
+  });
+
+  await cdp.send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: 65,
+    maxWidth: 1280,
+    maxHeight: 800,
+    everyNthFrame: 1
+  });
+
+  cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
+    await cdp
+      .send('Page.screencastFrameAck', { sessionId })
+      .catch(() => null);
+
+    broadcast(session, {
+      type: 'frame',
+      data
+    });
+  });
+
+  await page.goto(target.href, {
+    waitUntil: 'commit',
+    timeout: 45000
+  });
+
+  return {
+    id,
+    session
+  };
+}
+
 async function handleBrowserApi(request, response, requestUrl) {
   if (requestUrl.pathname === '/api/session' && request.method === 'POST') {
     const body = await parseJson(request);
@@ -95,51 +643,7 @@ async function handleBrowserApi(request, response, requestUrl) {
       throw new Error('Only http:// and https:// URLs are supported.');
     }
 
-    const context = await getBrowser();
-    const page = await context.newPage();
-    const cdp = await context.newCDPSession(page);
-    const id = crypto.randomUUID();
-
-    const session = {
-      context,
-      page,
-      cdp,
-      clients: new Set()
-    };
-
-    sessions.set(id, session);
-
-    page.on('close', () => {
-      sessions.delete(id);
-    });
-
-    await cdp.send('Page.startScreencast', {
-      format: 'jpeg',
-      quality: 85,
-      maxWidth: 1280,
-      maxHeight: 800,
-      everyNthFrame: 1
-    });
-
-    cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
-      for (const client of session.clients) {
-        if (client.readyState === 1) {
-          client.send(JSON.stringify({
-            type: 'frame',
-            data
-          }));
-        }
-      }
-
-      await cdp
-        .send('Page.screencastFrameAck', { sessionId })
-        .catch(() => null);
-    });
-
-    await page.goto(target.href, {
-      waitUntil: 'commit',
-      timeout: 45000
-    });
+    const { id, session } = await createBrowserSession(target);
 
     return sendJson(response, 201, {
       id,
@@ -157,20 +661,6 @@ async function handleBrowserApi(request, response, requestUrl) {
 
   if (request.method === 'GET' && action === 'state') {
     return sendJson(response, 200, await sessionState(session));
-  }
-
-  if (request.method === 'GET' && action === 'screenshot') {
-    const image = await session.page.screenshot({
-      type: 'jpeg',
-      quality: 82
-    });
-
-    response.writeHead(200, {
-      'Content-Type': 'image/jpeg',
-      'Cache-Control': 'no-store'
-    });
-
-    return response.end(image);
   }
 
   if (request.method === 'DELETE' && !action) {
@@ -212,21 +702,6 @@ async function handleBrowserApi(request, response, requestUrl) {
       waitUntil: 'commit',
       timeout: 45000
     });
-  }
-
-  if (request.method === 'POST' && action === 'click') {
-    await session.page.mouse.click(
-      Number(body.x),
-      Number(body.y)
-    );
-  }
-
-  if (request.method === 'POST' && action === 'type') {
-    await session.page.keyboard.type(String(body.text || ''));
-  }
-
-  if (request.method === 'POST' && action === 'key') {
-    await session.page.keyboard.press(String(body.key || 'Enter'));
   }
 
   return sendJson(response, 200, await sessionState(session));
@@ -284,6 +759,10 @@ async function assertPublicTarget(target) {
   }
 }
 
+function proxyUrl(target) {
+  return `/proxy?url=${encodeURIComponent(normalizeTarget(target).href)}`;
+}
+
 function normalizeTarget(target) {
   const normalized = new URL(target.href);
   const compValues = normalized.searchParams.getAll('comp');
@@ -293,47 +772,6 @@ function normalizeTarget(target) {
   }
 
   return normalized;
-}
-
-function proxyUrl(target) {
-  return `/proxy?url=${encodeURIComponent(normalizeTarget(target).href)}`;
-}
-
-function restoreAuthReturnUrl(target) {
-  const restored = new URL(target.href);
-
-  for (const parameter of ['returnUrl', 'ru']) {
-    const value = restored.searchParams.get(parameter);
-
-    if (!value) {
-      continue;
-    }
-
-    try {
-      const returnTarget = new URL(value);
-
-      if (
-        returnTarget.hostname === 'localhost' ||
-        returnTarget.hostname === '127.0.0.1'
-      ) {
-        restored.searchParams.set(
-          parameter,
-          `${restored.origin}${returnTarget.pathname}${returnTarget.search}`
-        );
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return restored;
-}
-
-function isLoginNavigation(target) {
-  return (
-    target.pathname.toLowerCase().includes('/auth/msa') &&
-    target.searchParams.get('action') === 'logIn'
-  );
 }
 
 function rewriteResource(value, baseUrl) {
@@ -372,7 +810,6 @@ function rewriteSrcset(value, baseUrl) {
       }
 
       parts[0] = rewriteResource(parts[0], baseUrl);
-
       return parts.join(' ');
     })
     .join(', ');
@@ -391,156 +828,39 @@ function rewriteCss(css, baseUrl) {
   );
 }
 
-function rewriteScript(script, baseUrl, pageOrigin = baseUrl) {
-  const origin = new URL(pageOrigin).origin;
-  const escapedOrigin = origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  const rewriteModuleReference = (match, prefix, value, suffix) => {
-    return `${prefix}${rewriteResource(value, baseUrl)}${suffix}`;
-  };
-
-  let rewritten = script
-    .replace(new RegExp(escapedOrigin, 'g'), '')
-    .replace(new RegExp(escapedOrigin.replaceAll('/', '\\/'), 'g'), '')
-    .replace(
-      /(\bimport\s*["'])(\.{1,2}\/[^"']+)(["'])/g,
-      rewriteModuleReference
-    )
-    .replace(
-      /(\bfrom\s*["'])(\.{1,2}\/[^"']+)(["'])/g,
-      rewriteModuleReference
-    )
-    .replace(
-      /(\bimport\s*\(\s*["'])(\.{1,2}\/[^"']+)(["']\s*\))/g,
-      rewriteModuleReference
-    );
-
-  if (script.includes('MsaAuthPage')) {
-    rewritten = rewritten.replace(
-      'const e="https:"',
-      'const e=window.location.protocol'
-    );
-  }
-
-  return rewritten;
-}
-
-function browserPath(target, request) {
-  const browserTarget = new URL(target.href);
-
-  if (browserTarget.pathname.includes('/auth/msa')) {
-    const localOrigin = `http://${request.headers.host}`;
-
-    for (const parameter of ['returnUrl', 'ru']) {
-      const value = browserTarget.searchParams.get(parameter);
-
-      if (!value) {
-        continue;
-      }
-
-      try {
-        const nestedTarget = new URL(value, target.href);
-
-        browserTarget.searchParams.set(
-          parameter,
-          `${localOrigin}${nestedTarget.pathname}${nestedTarget.search}`
-        );
-      } catch {
-        continue;
-      }
-    }
-  }
-
-  return (
-    `${browserTarget.pathname}${browserTarget.search}${browserTarget.hash}` ||
-    '/'
-  );
-}
-
 function rewriteHtml(html, baseUrl) {
   const attributePattern =
     /\b(href|src|action|poster|data|srcset)\s*=\s*(["'])(.*?)\2/gi;
 
-  const rewritten = html.replace(
+  return html.replace(
     attributePattern,
     (match, attribute, quote, value) => {
-      const rewrittenValue =
+      const rewritten =
         attribute.toLowerCase() === 'srcset'
           ? rewriteSrcset(value, baseUrl)
           : rewriteResource(value, baseUrl);
 
-      return rewrittenValue === value
+      return rewritten === value
         ? match
-        : `${attribute}=${quote}${rewrittenValue}${quote}`;
+        : `${attribute}=${quote}${rewritten}${quote}`;
     }
   );
-
-  return rewritten
-    .replace(
-      /(<(?:a|area)\b[^>]*\bhref=["'])(\/proxy\?url=[^"']+)/gi,
-      (match, prefix, value) => {
-        return `${prefix}${value.includes('reset=1') ? value : `${value}&reset=1`}`;
-      }
-    )
-    .replace(
-      /(<form\b[^>]*\baction=["'])(\/proxy\?url=[^"']+)/gi,
-      (match, prefix, value) => {
-        return `${prefix}${value.includes('reset=1') ? value : `${value}&reset=1`}`;
-      }
-    );
-}
-
-function cookieValue(request, name) {
-  const cookies = request.headers.cookie || '';
-
-  const entry = cookies
-    .split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(`${name}=`));
-
-  return entry
-    ? decodeURIComponent(entry.slice(name.length + 1))
-    : null;
-}
-
-function upstreamCookieHeader(request) {
-  return (request.headers.cookie || '')
-    .split(';')
-    .map((part) => part.trim())
-    .filter((part) => part && !part.startsWith('relay-target='))
-    .join('; ');
-}
-
-function localSetCookies(upstream) {
-  const cookies =
-    typeof upstream.headers.getSetCookie === 'function'
-      ? upstream.headers.getSetCookie()
-      : [];
-
-  return cookies.map((cookie) => {
-    return cookie
-      .replace(/;\s*Domain=[^;]*/ig, '')
-      .replace(/;\s*Secure/ig, '');
-  });
 }
 
 async function fetchUpstream(request, target) {
   let currentTarget = normalizeTarget(target);
-  const cookieHeader = upstreamCookieHeader(request);
-  const relayHost = request.headers.host || `localhost:${PORT}`;
-
   let redirectCount = 0;
-  let upstream;
 
   while (true) {
-    upstream = await fetch(currentTarget, {
+    await assertPublicTarget(currentTarget);
+
+    const upstream = await fetch(currentTarget, {
       redirect: 'manual',
       headers: {
         Accept:
           'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.8',
-        'User-Agent': `Mozilla/5.0 (compatible; Relay/1.0; +http://${relayHost})`,
-        ...(cookieHeader ? { Cookie: cookieHeader } : {})
+        'User-Agent': 'Mozilla/5.0 (compatible; Relay/1.0)'
       }
     });
 
@@ -550,67 +870,28 @@ async function fetchUpstream(request, target) {
       ![301, 302, 303, 307, 308].includes(upstream.status) ||
       !location
     ) {
-      break;
+      return {
+        upstream,
+        target: currentTarget,
+        redirectCount
+      };
     }
 
     if (redirectCount >= 10) {
       throw new Error('The upstream site redirected too many times.');
     }
 
-    const nextTarget = normalizeTarget(
+    currentTarget = normalizeTarget(
       new URL(location, currentTarget)
     );
 
-    await assertPublicTarget(nextTarget);
-
-    currentTarget = nextTarget;
     redirectCount += 1;
   }
-
-  return {
-    upstream,
-    target: currentTarget,
-    redirectCount
-  };
 }
 
-async function handleProxy(request, response, target, resetRoute = false) {
-  target = normalizeTarget(target);
-
-  if (isLoginNavigation(target)) {
-    response.writeHead(302, {
-      Location: `/remote?url=${encodeURIComponent(
-        restoreAuthReturnUrl(target).href
-      )}`,
-      'Cache-Control': 'no-store'
-    });
-
-    response.end();
-    return;
-  }
-
-  const startedAt = performance.now();
-  const metrics = {};
-
-  const mark = (name) => {
-    metrics[name] =
-      Math.round((performance.now() - startedAt) * 100) / 100;
-  };
-
-  await assertPublicTarget(target);
-  mark('dns');
-
-  const fetchStartedAt = performance.now();
+async function handleProxy(request, response, target) {
   const fetched = await fetchUpstream(request, target);
-  const upstream = fetched.upstream;
-
-  metrics.fetch =
-    Math.round((performance.now() - fetchStartedAt) * 100) / 100;
-
-  const finalTarget = fetched.target;
-
-  await assertPublicTarget(finalTarget);
-  mark('headers');
+  const { upstream, target: finalTarget } = fetched;
 
   const contentType =
     upstream.headers.get('content-type') ||
@@ -619,80 +900,27 @@ async function handleProxy(request, response, target, resetRoute = false) {
   const headers = {
     'Content-Type': contentType,
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
-    'Timing-Allow-Origin': '*',
-    'X-Proxy-Upstream': finalTarget.href
+    'X-Content-Type-Options': 'nosniff'
   };
 
   let body;
 
   if (contentType.includes('text/html')) {
-    const html = await upstream.text();
-
-    const bridge = `<script>history.replaceState(null, document.title, ${JSON.stringify(
-      browserPath(finalTarget, request)
-    )});</script>`;
-
-    const rewritten = rewriteHtml(html, finalTarget.href);
-
     body = Buffer.from(
-      rewritten.replace(/<\/head>/i, `${bridge}</head>`)
+      rewriteHtml(await upstream.text(), finalTarget.href)
     );
   } else if (contentType.includes('text/css')) {
-    const css = await upstream.text();
-    body = Buffer.from(rewriteCss(css, finalTarget.href));
-  } else if (contentType.includes('javascript')) {
-    const script = await upstream.text();
-
-    const pageOrigin =
-      cookieValue(request, 'relay-target') ||
-      finalTarget.origin;
-
     body = Buffer.from(
-      rewriteScript(script, finalTarget.href, pageOrigin)
+      rewriteCss(await upstream.text(), finalTarget.href)
     );
   } else {
     body = Buffer.from(await upstream.arrayBuffer());
   }
 
-  mark('body');
-
-  metrics.bytes = body.length;
-  mark('total');
-
-  headers['X-Proxy-Bytes'] = String(body.length);
-
-  headers['X-Proxy-Metrics'] = JSON.stringify({
-    ...metrics,
-    status: upstream.status,
-    redirects: fetched.redirectCount
-  });
-
-  const routeOrigin = resetRoute
-    ? finalTarget.origin
-    : (cookieValue(request, 'relay-target') || finalTarget.origin);
-
-  headers['Set-Cookie'] = [
-    `relay-target=${encodeURIComponent(
-      routeOrigin
-    )}; Path=/; SameSite=Lax`,
-    ...localSetCookies(upstream)
-  ];
-
   response.writeHead(upstream.status, headers);
   response.end(body);
-
-  console.log(
-    `[proxy] ${request.method} ${target.href} -> ${upstream.status} ${contentType} ${headers['X-Proxy-Metrics']}`
-  );
 }
 
-/*
- * CDP/Chromium virtual key codes.
- *
- * These make non-text keys—including Backspace, Delete, Tab, Enter,
- * and the cursor-arrow keys—operate normally in the remote page.
- */
 const VIRTUAL_KEY_CODES = {
   Backspace: 8,
   Tab: 9,
@@ -703,7 +931,6 @@ const VIRTUAL_KEY_CODES = {
   Pause: 19,
   CapsLock: 20,
   Escape: 27,
-  ' ': 32,
   PageUp: 33,
   PageDown: 34,
   End: 35,
@@ -715,23 +942,61 @@ const VIRTUAL_KEY_CODES = {
   Insert: 45,
   Delete: 46,
   Meta: 91,
-  ContextMenu: 93
+  ContextMenu: 93,
+  NumLock: 144,
+  ScrollLock: 145
 };
 
 function virtualKeyCode(event) {
-  if (VIRTUAL_KEY_CODES[event.key] !== undefined) {
-    return VIRTUAL_KEY_CODES[event.key];
-  }
+  return VIRTUAL_KEY_CODES[event.key] ??
+    Number(event.keyCode || event.which || 0);
+}
 
-  if (/^F([1-9]|1[0-2])$/.test(event.key)) {
-    return 111 + Number(event.key.slice(1));
-  }
+async function handleUpload(request, response, session) {
+  let files = [];
 
-  if (event.key.length === 1) {
-    return event.key.toUpperCase().charCodeAt(0);
-  }
+  try {
+    files = await receiveUpload(request);
 
-  return Number(event.keyCode || event.which || 0);
+    if (files.length === 0) {
+      return sendJson(response, 400, {
+        error: 'Choose at least one file.'
+      });
+    }
+
+    const chooser = session.pendingFileChooser;
+    session.pendingFileChooser = null;
+
+    if (!chooser) {
+      deleteTemporaryUploads(files);
+
+      return sendJson(response, 409, {
+        error: 'The remote site is not currently requesting a file.'
+      });
+    }
+
+    await chooser.setFiles(files.map((file) => file.path));
+
+    /*
+     * Keep files while the remote page processes/uploads them.
+     * They are removed when its remote tab closes.
+     */
+    session.uploadedFiles.push(...files);
+
+    return sendJson(response, 200, {
+      ok: true,
+      files: files.map((file) => ({
+        name: file.name,
+        size: file.size
+      }))
+    });
+  } catch (error) {
+    deleteTemporaryUploads(files);
+
+    return sendJson(response, 400, {
+      error: error.message || 'File upload failed.'
+    });
+  }
 }
 
 const server = http.createServer(async (request, response) => {
@@ -740,6 +1005,28 @@ const server = http.createServer(async (request, response) => {
       request.url,
       `http://${request.headers.host}`
     );
+
+    const uploadMatch = requestUrl.pathname.match(
+      /^\/api\/session\/([a-f0-9-]+)\/upload$/
+    );
+
+    if (request.method === 'POST' && uploadMatch) {
+      const session = sessions.get(uploadMatch[1]);
+
+      if (!session) {
+        return sendJson(response, 404, {
+          error: 'Browser session not found.'
+        });
+      }
+
+      if (!session.pendingFileChooser) {
+        return sendJson(response, 409, {
+          error: 'The remote site is not currently requesting a file.'
+        });
+      }
+
+      return handleUpload(request, response, session);
+    }
 
     if (requestUrl.pathname === '/remote') {
       return serveFile(
@@ -799,18 +1086,11 @@ const server = http.createServer(async (request, response) => {
         throw new Error('Add a URL to proxy.');
       }
 
-      const resetRoute =
-        requestUrl.searchParams.get('reset') === '1' ||
-        !cookieValue(request, 'relay-target');
-
-      await handleProxy(
+      return handleProxy(
         request,
         response,
-        new URL(rawTarget),
-        resetRoute
+        new URL(rawTarget)
       );
-
-      return;
     }
 
     if (requestUrl.pathname === '/app.js') {
@@ -833,27 +1113,8 @@ const server = http.createServer(async (request, response) => {
       return serveFile(
         response,
         'index.html',
-        'text/html; charset=utf-8',
-        {
-          'Set-Cookie':
-            'relay-target=; Max-Age=0; Path=/; SameSite=Lax'
-        }
+        'text/html; charset=utf-8'
       );
-    }
-
-    const relayTarget = cookieValue(request, 'relay-target');
-
-    if (relayTarget) {
-      await handleProxy(
-        request,
-        response,
-        new URL(
-          `${requestUrl.pathname}${requestUrl.search}`,
-          relayTarget
-        )
-      );
-
-      return;
     }
 
     return serveFile(
@@ -862,13 +1123,13 @@ const server = http.createServer(async (request, response) => {
       'text/html; charset=utf-8'
     );
   } catch (error) {
-    response.writeHead(400, {
-      'Content-Type': 'application/json; charset=utf-8'
-    });
+    console.error(error);
 
-    response.end(JSON.stringify({
-      error: error.message
-    }));
+    if (!response.headersSent) {
+      sendJson(response, 400, {
+        error: error.message || 'Request failed.'
+      });
+    }
   }
 });
 
@@ -881,9 +1142,22 @@ streamServer.on('connection', (socket, request, session) => {
     session.clients.delete(socket);
   });
 
-  socket.on('message', async (message) => {
+  socket.on('message', async (message, isBinary) => {
     try {
+      if (isBinary) {
+        writeMicrophoneAudio(message);
+        return;
+      }
+
       const event = JSON.parse(message.toString());
+
+      if (event.type === 'audio-signal') {
+        await session.page.evaluate(async (signal) => {
+          await window.__relayReceiveAudioSignal?.(signal);
+        }, event.signal);
+
+        return;
+      }
 
       if (event.type === 'mouse') {
         await session.cdp.send('Input.dispatchMouseEvent', {
@@ -912,48 +1186,40 @@ streamServer.on('connection', (socket, request, session) => {
 
       if (event.type === 'key') {
         const modifiers =
-        (event.altKey ? 1 : 0) |
-        (event.ctrlKey ? 2 : 0) |
-        (event.metaKey ? 4 : 0) |
-        (event.shiftKey ? 8 : 0);
+          (event.altKey ? 1 : 0) |
+          (event.ctrlKey ? 2 : 0) |
+          (event.metaKey ? 4 : 0) |
+          (event.shiftKey ? 8 : 0);
 
         const keyDown = event.action === 'keyDown';
 
         const isPrintable =
-        typeof event.key === 'string' &&
-        event.key.length === 1 &&
-        !event.ctrlKey &&
-        !event.altKey &&
-        !event.metaKey;
+          typeof event.key === 'string' &&
+          event.key.length === 1 &&
+          !event.ctrlKey &&
+          !event.altKey &&
+          !event.metaKey;
 
-  /*
-   * Text characters—including punctuation such as "."—are sent with
-   * CDP's `char` event. Do not assign them a Windows virtual-key code:
-   * ASCII "." is 46, which CDP interprets as the Delete key.
-   */
-          if (keyDown && isPrintable) {
-            await session.cdp.send('Input.dispatchKeyEvent', {
-              type: 'char',
-              text: event.key,
-              unmodifiedText: event.key,
-              modifiers
-            });
+        /*
+         * Printable characters use CDP's "char" event. That prevents
+         * punctuation such as "." from colliding with Delete's virtual
+         * key code (46).
+         */
+        if (keyDown && isPrintable) {
+          await session.cdp.send('Input.dispatchKeyEvent', {
+            type: 'char',
+            text: event.key,
+            unmodifiedText: event.key,
+            modifiers
+          });
 
           return;
         }
 
-  /*
-   * A printable key-up has no remote editing work to perform. The text
-   * was already inserted by its `char` event above.
-   */
         if (!keyDown && isPrintable) {
           return;
         }
 
-  /*
-   * Non-printing keys need CDP's low-level event path so controls,
-   * text fields, cursor navigation, and deletion behave normally.
-   */
         const virtualKey = virtualKeyCode(event);
 
         await session.cdp.send('Input.dispatchKeyEvent', {
@@ -966,11 +1232,10 @@ streamServer.on('connection', (socket, request, session) => {
           modifiers,
           autoRepeat: Boolean(event.repeat)
         });
-
-        return;
       }
+    } catch (error) {
+      console.error('Input event failed:', error.message);
 
-    } catch {
       if (socket.readyState === 1) {
         socket.send(JSON.stringify({
           type: 'error',
@@ -1014,5 +1279,8 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 server.listen(PORT, () => {
+  setupAudioOutput();
   console.log(`Web proxy running at http://localhost:${PORT}`);
 });
+
+process.on('exit', stopAudioOutput);
