@@ -51,6 +51,23 @@
 
       <footer class="controls">
         <span><i></i> LIVE BROWSER SESSION</span>
+
+        <div class="media-controls">
+          <button id="sound" type="button">Enable sound</button>
+          <button id="microphone" type="button">Enable mic</button>
+          <button id="stop-microphone" type="button" hidden>Stop mic</button>
+
+          <span id="mic-status" class="mic-status">Mic off</span>
+          <meter
+            id="mic-level"
+            class="mic-level"
+            min="0"
+            max="1"
+            value="0"
+            aria-label="Microphone input level"
+          ></meter>
+        </div>
+
         <span class="hint">CLICK AND TYPE DIRECTLY IN THE VIEWPORT</span>
       </footer>
     </main>

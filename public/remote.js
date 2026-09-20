@@ -4,6 +4,11 @@ const state = document.querySelector('#state');
 const screen = document.querySelector('#screen');
 const empty = document.querySelector('#empty');
 const localFilePicker = document.querySelector('#local-file-picker');
+const soundButton = document.querySelector('#sound');
+const microphoneButton = document.querySelector('#microphone');
+const stopMicrophoneButton = document.querySelector('#stop-microphone');
+const micStatus = document.querySelector('#mic-status');
+const micLevel = document.querySelector('#mic-level');
 
 const canvas = screen;
 const context = canvas.getContext('2d');
@@ -13,6 +18,127 @@ let sessionId = null;
 let refreshTimer = null;
 let viewport = { width: 1280, height: 800 };
 let stream = null;
+let audioContext = null;
+let soundEnabled = false;
+let microphoneStream = null;
+let microphoneContext = null;
+let microphoneAnalyser = null;
+let microphoneMeterFrame = null;
+
+function playAlertTone() {
+  if (!soundEnabled || !audioContext) {
+    return;
+  }
+
+  const now = audioContext.currentTime;
+  const oscillator = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+
+  oscillator.type = 'sine';
+  oscillator.frequency.setValueAtTime(740, now);
+  oscillator.frequency.setValueAtTime(1047, now + 0.13);
+
+  gain.gain.setValueAtTime(0.001, now);
+  gain.gain.exponentialRampToValueAtTime(0.14, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+
+  oscillator.connect(gain);
+  gain.connect(audioContext.destination);
+
+  oscillator.start(now);
+  oscillator.stop(now + 0.31);
+}
+
+function stopMicrophone() {
+  if (microphoneMeterFrame) {
+    cancelAnimationFrame(microphoneMeterFrame);
+    microphoneMeterFrame = null;
+  }
+
+  if (microphoneStream) {
+    for (const track of microphoneStream.getTracks()) {
+      track.stop();
+    }
+  }
+
+  microphoneStream = null;
+  microphoneAnalyser = null;
+
+  if (microphoneContext) {
+    microphoneContext.close().catch(() => {});
+  }
+
+  microphoneContext = null;
+  micLevel.value = 0;
+  micStatus.textContent = 'Mic off';
+  micStatus.classList.remove('live');
+  microphoneButton.hidden = false;
+  stopMicrophoneButton.hidden = true;
+}
+
+function updateMicrophoneLevel() {
+  if (!microphoneAnalyser) {
+    return;
+  }
+
+  const samples = new Uint8Array(microphoneAnalyser.fftSize);
+  microphoneAnalyser.getByteTimeDomainData(samples);
+
+  let total = 0;
+
+  for (const sample of samples) {
+    const normalized = (sample - 128) / 128;
+    total += normalized * normalized;
+  }
+
+  micLevel.value = Math.min(1, Math.sqrt(total / samples.length) * 3);
+  microphoneMeterFrame = requestAnimationFrame(updateMicrophoneLevel);
+}
+
+soundButton.addEventListener('click', async () => {
+  audioContext ??= new AudioContext();
+
+  await audioContext.resume();
+
+  soundEnabled = true;
+  soundButton.textContent = 'Sound enabled';
+
+  playAlertTone();
+});
+
+microphoneButton.addEventListener('click', async () => {
+  try {
+    micStatus.textContent = 'Requesting mic…';
+
+    microphoneStream = await navigator.mediaDevices.getUserMedia({
+      audio: true
+    });
+
+    microphoneContext = new AudioContext();
+    const source = microphoneContext.createMediaStreamSource(
+      microphoneStream
+    );
+
+    microphoneAnalyser = microphoneContext.createAnalyser();
+    microphoneAnalyser.fftSize = 1024;
+
+    source.connect(microphoneAnalyser);
+
+    micStatus.textContent = 'Mic live (local only)';
+    micStatus.classList.add('live');
+    microphoneButton.hidden = true;
+    stopMicrophoneButton.hidden = false;
+
+    updateMicrophoneLevel();
+  } catch (error) {
+    console.error(error);
+    micStatus.textContent = 'Mic blocked or unavailable';
+  }
+});
+
+stopMicrophoneButton.addEventListener('click', stopMicrophone);
+
+window.addEventListener('pagehide', stopMicrophone);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {

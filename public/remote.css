@@ -23,4 +23,44 @@ h1 em { color: #778b36; font-style: normal; }
 .controls { border-top: 1px solid var(--line); border-bottom: 0; color: var(--muted); }
 .controls i { display: inline-block; width: 7px; height: 7px; margin-right: 7px; background: #63b96b; border-radius: 50%; }
 .hint { margin-left: auto; color: var(--muted); }
+.media-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.media-controls button {
+  padding: 8px 10px;
+  font-size: 11px;
+}
+
+.media-controls button[hidden] {
+  display: none;
+}
+
+.mic-status {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mic-status.live {
+  color: #2c7a38;
+}
+
+.mic-level {
+  width: 72px;
+  height: 10px;
+  accent-color: #63b96b;
+}
+
+@media (max-width: 760px) {
+  .media-controls {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .hint {
+    margin-left: 0;
+  }
+}
 @media (max-width: 760px) { .browser-shell { width: calc(100% - 24px); } .toolbar { flex-wrap: wrap; padding: 14px 0; } .address-bar { order: 3; flex-basis: 100%; } .state { max-width: 130px; } .controls { flex-wrap: wrap; padding: 14px 0; } .controls label { margin-left: 0; } }
